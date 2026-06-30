@@ -45,12 +45,14 @@
 2. **跨域边后置串行补**:基于全局 graph 抽跨域 calls/depends-on(并发的盲区,必须补)。
 3. **一致性校验**:术语统一、cite 格式、抽象层级对齐。
 4. **冲突去重**:共享模块若被某域 agent 误画,归一到支撑层单点产物。
-5. **产出 report.md**:整合的冲突、去重、跨域边补全情况。
+5. **运行覆盖审计(串行,门禁)**:归并完、产 report 前跑 `audit.py`(见 `coverage-audit.md`)——拿文件系统标尺验全量覆盖、cite、规模。**整合 agent 串行跑一次,绝不并发**(audit 读全局 graph + 全部文档,并发既无意义又竞争)。退出码 0 才进下一步;非 0 回 `iterative-refinement.md` 收敛。
+6. **产出 report.md**:整合的冲突、去重、跨域边补全情况 + audit 结论。
 
 ## 质量保证(承认 sub-agent 单点质量略低于主 agent,用机制拉回)
 
 - **schema 是安全网**:严格 schema 校验,格式不对打回。
-- **cite 自检脚本化**:确定性脚本验证所有 file:// 链接,不靠 agent 自证。
+- **cite 自检脚本化(= 覆盖审计 C 关)**:确定性脚本验证所有 file:// 链接,不靠 agent 自证——已统一进 `audit.py`(见 `coverage-audit.md` §6)。
+- **audit 由整合 agent 串行跑一次**:归并后、report 前,不并发;退出码 0 才进 report(见上方整合流程第 5 步)。
 - **spot check**:整合 agent 抽查各域核心调用链(agent 可能有系统性错误,如漏 cite、乱推断)。
 - **关键部分回退串行**:L0、跨域边、核心调用链若整合时发现质量不够,串行重做,不将就。
 

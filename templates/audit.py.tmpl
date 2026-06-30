@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+"""覆盖审计(coverage audit)—— repo-knowledge-map skill 的客观校验脚本。
+
+>>> 行为规范见 references/coverage-audit.md(单一事实源)。<<<
+
+为什么有这个脚本(skill 首个可执行产物):
+  - AI 生成知识地图会"理解代码",但会因注意力**漏掉整个子系统**(实测漏过)。
+  - 本脚本不理解代码(做不到),只做 AI 做不到的**穷举校验**:拿文件系统当绝对标尺,
+    验 AI 产物(graph.json + 文档)有无结构性遗漏、cite 真不真、规模数抄错没。
+  - 结构层(覆盖/cite/规模)= 文件系统闭集,可保证零遗漏;语义层(职责/流程)无客观
+    标尺,本脚本不碰,留待 report 透明标注。
+
+三关:
+  A 覆盖完备(核心):顶层实体每个或被覆盖、或显式排除(附理由),无孤儿。标尺=os.listdir。
+  B 计数一致(辅助):graph 计数 vs 文档计数 vs wc 实测。只抓"不一致",抓不到"共同遗漏"。
+  C cite 验真    :所有 file:// 路径存在、行号在范围内。
+  + 规模真实(子项):文档里"NNN LOC/行/文件"断言用 wc 实测复核(查抄 AI 文档的数字)。
+
+零外部依赖:仅用标准库(不引 PyYAML,audit-excluded.yaml 手写极简解析)。
+
+用法:
+  python3 audit.py                                  # 自动探测仓库根
+  python3 audit.py --repo /path/to/repo
+  python3 audit.py --repo . --km-dir ./.knowledge-map --excluded ./audit-excluded.yaml
+退出码: 0 = A 无孤儿 且 C 全过 且 规模真实; 1 = 任一核心关失败(report 必列清单); 2 = 用法错。
+"""
+import os
+import re
+import sys
+import json
+import fnmatch
+import argparse
+
+# ============================================================================
+# CONFIG —— skill 实例化时按目标仓库调整这一段(留默认也能跑)。{{CUSTOMIZE}}
+# 其余一律走 argparse + 自动探测,绝不硬编码绝对路径。
+# ============================================================================
+
+# B 关:从文档(INDEX.md/report.md)抽取"N 个 XXX"这类计数断言的正则。
+# 留空则 B 关降级为"仅报告 graph 计数",不作文档计数比对(诚实降级,不假装比对了)。
+DOC_COUNT_REGEXES = [
+    # {{DOC_COUNT_REGEX}} 按该仓库文档措辞填,如: r'(\d+)\s*个子系统', r'(\d+)\s*modules'
+]
+
+# 默认排除的顶层实体(通用:元数据/依赖/文档)。仓库特有排除请放 audit-excluded.yaml。
+DEFAULT_EXCLUDED = {
+    '.git': '版本控制元数据',
+    'node_modules': '前端依赖',
+    'vendor': '第三方依赖',
+    '.knowledge-map': '知识地图自身产物',
+}
+
+# 规模断言"超过实测 × 此倍数"才算不符(容忍 ~NNN 的取整)。
+SCALE_OVERSTATE_FACTOR = 1.5
+
+
+# ----------------------------------------------------------------------------
+# 标尺:文件系统客观测量(ground truth 闭集)。
+#   ★ 注意:标尺只来自 os.listdir / os.walk / wc,绝不读 graph/README/AGENTS.md。
+#     (拿 AI 产物当标尺会被污染——实测中 graph 与文档都抄 AGENTS.md 写 "~12k",
+#      对账一致却都错了一倍。只有不经过 AI 的文件系统能当绝对标尺。)
+# ----------------------------------------------------------------------------
+
+def detect_repo_root(start):
+    """从 start 向上找含 .git 或 .knowledge-map 的目录作仓库根;找不到返回 start。"""
+    cur = os.path.abspath(start)
+    root = os.path.dirname(cur)
+    while True:
+        if os.path.isdir(os.path.join(cur, '.git')) or os.path.isdir(os.path.join(cur, '.knowledge-map')):
+            return cur
+        if cur == root:
+            return cur
+        cur = root
+        root = os.path.dirname(cur)
+
+
+def top_level_entities(repo):
+    """顶层实体(文件+目录)= A 关标尺闭集。不过滤 dotfile(避免静默漏掉 .github 等),
+    噪声交给 EXCLUDED 显式声明。"""
+    return sorted(os.listdir(repo))
+
+
+def _wc_lines(path):
+    """文件行数。"""
+    with open(path, encoding='utf-8', errors='replace') as fh:
+        return sum(1 for _ in fh)
+
+
+def _count_source_files(path):
+    """目录内源文件数(按常见扩展名;计数口径有约定性,故仅作软提示)。"""
+    exts = ('.py', '.go', '.js', '.ts', '.jsx', '.tsx', '.rs', '.java', '.c', '.cpp', '.h', '.rb', '.sh', '.vue')
+    n = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            if f.endswith(exts):
+                n += 1
+    return n
+
+
+# ----------------------------------------------------------------------------
+# EXCLUDED 配置:外置 yaml(手写极简解析,免 PyYAML)。reason 必填,无 reason 降级孤儿。
+# ----------------------------------------------------------------------------
+
+def parse_excluded(yaml_path):
+    """解析 audit-excluded.yaml。格式:每行 '<pattern>: <reason>';'#' 开头为注释。
+    支持 fnmatch glob(* ?)。返回 [(pattern, reason|None)];reason=None 视为无效(降级孤儿)。"""
+    items = []
+    if not yaml_path or not os.path.exists(yaml_path):
+        return items
+    for raw in open(yaml_path, encoding='utf-8'):
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        if ':' not in line:
+            items.append((line, None))           # 有 pattern 无 reason → 无效
+            continue
+        pat, _, reason = line.partition(':')
+        items.append((pat.strip(), reason.strip() or None))
+    return items
+
+
+def match_excluded(name, excluded):
+    """返回 name 命中的 (pattern, reason);未命中或命中项 reason=None 返回 None。"""
+    for pat, reason in excluded:
+        if reason is None:
+            continue
+        if fnmatch.fnmatch(name, pat) or fnmatch.fnmatch(name.rstrip('/'), pat.rstrip('/')):
+            return (pat, reason)
+    return None
+
+
+# ----------------------------------------------------------------------------
+# 覆盖集:从 graph.json 抽(files ∪ cite ∪ path),归一化到顶层粒度。
+# ----------------------------------------------------------------------------
+
+# 路径字符收紧到 [A-Za-z0-9_./@\-]:避免吃进 markdown 反引号/括号(实测 `[^#\s]+` 会把
+# `file://`tools/x`(`desc`...) 整段当路径,误报 MISSING)。
+CITE_RE = re.compile(r'file://([A-Za-z0-9_./@\-]+)(?:#L(\d+)(?:-L?(\d+))?)?')
+
+
+def _top_of(path):
+    """把任意相对路径归一化到顶层实体名(第一段)。"""
+    p = (path or '').strip().lstrip('./').rstrip('/')
+    return p.split('/')[0] or None
+
+
+def extract_coverage(graph):
+    """返回 (claimed, cite_covered):
+       claimed      = 所有被 claim 覆盖的顶层实体(files ∪ path ∪ cite)
+       cite_covered = 有真 cite(file:// 指向其下)的顶层实体(强覆盖)"""
+    claimed, cite_covered = set(), set()
+    for n in graph.get('nodes', []):
+        for f in n.get('files') or []:
+            t = _top_of(str(f))
+            if t:
+                claimed.add(t)
+        t = _top_of(str(n.get('path') or ''))
+        if t:
+            claimed.add(t)
+        m = CITE_RE.search(str(n.get('cite') or ''))
+        if m:
+            t = _top_of(m.group(1))
+            if t:
+                claimed.add(t)
+                cite_covered.add(t)
+    return claimed, cite_covered
+
+
+# ----------------------------------------------------------------------------
+# A 关 — 覆盖完备(核心):无孤儿 = 无重大遗漏。
+# ----------------------------------------------------------------------------
+
+def cited_top_entities(km_dir):
+    """扫描所有文档(同 C 关候选)的 file:// cite,归一化到顶层 → 有证据的顶层实体集。
+    弱覆盖判定时与 graph 节点 cite 合并:某实体只要在知识地图任意处被真 cite 过,即非弱覆盖。"""
+    out = set()
+    for path in _doc_candidates(km_dir):
+        txt = open(path, encoding='utf-8', errors='replace').read()
+        for m in CITE_RE.finditer(txt):
+            t = _top_of(m.group(1))
+            if t:
+                out.add(t)
+    return out
+
+
+def audit_coverage(repo, graph, excluded, km_dir):
+    top = top_level_entities(repo)
+    claimed, cite_covered = extract_coverage(graph)
+    cite_covered = cite_covered | cited_top_entities(km_dir)
+    covered, excluded_out, orphans, weak = [], [], [], []
+    for name in top:
+        if name in claimed:
+            covered.append(name)
+            if name not in cite_covered:
+                weak.append(name)        # 名义覆盖(files/path)但无真 cite → 警告(不失败)
+            continue
+        hit = match_excluded(name, excluded)
+        if hit:
+            excluded_out.append((name, hit[1]))
+        else:
+            orphans.append(name)         # 既未覆盖、又无有效排除 → 孤儿(A 关失败)
+    return {'top': top, 'covered': covered, 'excluded': excluded_out,
+            'orphans': orphans, 'weak': weak}
+
+
+# ----------------------------------------------------------------------------
+# B 关 — 计数一致(辅助,明确降级):只抓"不一致",抓不到"共同遗漏"。
+# ----------------------------------------------------------------------------
+
+def count_nodes_by_kind(graph):
+    out = {}
+    for n in graph.get('nodes', []):
+        k = n.get('kind', '?')
+        out[k] = out.get(k, 0) + 1
+    return out
+
+
+def audit_counts(graph, km_dir):
+    """报告 graph 节点计数 + 抽文档计数断言(供人工核对)。
+    ★ B 关通过 ≠ 数字正确:graph 与文档可能抄同一错误数字,对账一致也错。"""
+    by_kind = count_nodes_by_kind(graph)
+    claims = []
+    idx = os.path.join(km_dir, 'INDEX.md')
+    doc_text = open(idx, encoding='utf-8', errors='replace').read() if os.path.exists(idx) else ''
+    for rx in DOC_COUNT_REGEXES:
+        for m in re.finditer(rx, doc_text):
+            claims.append(m.group(0).strip())
+    return by_kind, claims
+
+
+# ----------------------------------------------------------------------------
+# C 关 — cite 验真:路径存在 + 行号在范围内。
+# ----------------------------------------------------------------------------
+
+def _doc_candidates(km_dir):
+    cands = []
+    idx = os.path.join(km_dir, 'INDEX.md')
+    if os.path.exists(idx):
+        cands.append(idx)
+    for fn in ('report.md',):
+        p = os.path.join(km_dir, fn)
+        if os.path.exists(p):
+            cands.append(p)
+    meta = os.path.join(km_dir, 'zh', 'meta')
+    if os.path.isdir(meta):
+        for f in os.listdir(meta):
+            if f.endswith('.json'):
+                cands.append(os.path.join(meta, f))
+    content = os.path.join(km_dir, 'zh', 'content')
+    if os.path.isdir(content):
+        for root, _, files in os.walk(content):
+            for f in files:
+                if f.endswith('.md'):
+                    cands.append(os.path.join(root, f))
+    return cands
+
+
+def audit_cites(repo, km_dir):
+    """收集所有文档的 file:// cite,验路径存在 + 行号范围。返回 (总数, 失效清单)。"""
+    seen, bad = set(), []
+    for path in _doc_candidates(km_dir):
+        txt = open(path, encoding='utf-8', errors='replace').read()
+        for m in CITE_RE.finditer(txt):
+            ref, l1, l2 = m.group(1), m.group(2), m.group(3)
+            key = (ref.lower(), l1, l2)
+            if key in seen:
+                continue
+            seen.add(key)
+            full = os.path.join(repo, ref)
+            if not os.path.exists(full):
+                bad.append(('MISSING', ref))
+                continue
+            if l1 and os.path.isfile(full):
+                n = _wc_lines(full)
+                a, b = int(l1), int(l2) if l2 else int(l1)
+                if a > n:
+                    bad.append(('LINE_OOR', f'{ref}#L{l1} > {n}'))
+                elif b < a:
+                    bad.append(('RANGE_INV', f'{ref}#L{l1}-L{l2}'))
+    return len(seen), bad
+
+
+# ----------------------------------------------------------------------------
+# 规模真实(子项):wc 实测 vs 文档断言。查"抄 AI 文档的数字"。
+#   hard = 文件级 LOC/行 断言严重高估 → 计入退出码门禁(可精确测量)。
+#   soft = 目录/文件数 断言(口径有约定性)→ 仅提示,不门禁。
+# ----------------------------------------------------------------------------
+
+SCALE_RE = re.compile(r'~?\s*(\d[\d,]*)\s*(k)?\s*(LOC|lines?|行|文件|files?)', re.IGNORECASE)
+PATH_NEAR = re.compile(r'([A-Za-z0-9_./-]+\.(?:py|go|js|ts|jsx|tsx|rs|java|c|cpp|h|rb|md|sh|vue))')
+
+
+def verify_scale(repo, km_dir):
+    hard, soft = [], []
+    docs = [os.path.join(km_dir, f) for f in ('INDEX.md', 'report.md')
+            if os.path.exists(os.path.join(km_dir, f))]
+    for doc in docs:
+        lines = open(doc, encoding='utf-8', errors='replace').read().splitlines()
+        for i, ln in enumerate(lines):
+            for m in SCALE_RE.finditer(ln):
+                claimed = int(m.group(1).replace(',', ''))
+                if m.group(2):                       # k → ×1000
+                    claimed *= 1000
+                unit = m.group(3).lower()
+                # 就近找文件路径:优先取"数字之前"最近的路径(主语通常在数字前,如"X.py ... 12k LOC");
+                # 数字前无路径才退回数字之后最近的。避免把括号里的引用源(如"(AGENTS.md 自述)")当主语。
+                cands = [(pm.start(), pm.group(1)) for pm in PATH_NEAR.finditer(ln)]
+                if not cands and i > 0:
+                    cands = [(pm.start(), pm.group(1)) for pm in PATH_NEAR.finditer(lines[i - 1])]
+                if not cands:
+                    continue
+                before = [c for c in cands if c[0] < m.start()]
+                if before:
+                    nearest = max(before, key=lambda c: c[0])[1]
+                else:
+                    nearest = min(cands, key=lambda c: abs(c[0] - m.start()))[1]
+                target = os.path.join(repo, nearest)
+                if not os.path.exists(target):
+                    continue
+                if os.path.isfile(target):
+                    actual = _wc_lines(target)
+                    is_loc = unit in ('loc', 'line', 'lines', '行')
+                    rec = (os.path.basename(doc), nearest, claimed, actual, ln.strip()[:70])
+                    if is_loc and claimed > actual * SCALE_OVERSTATE_FACTOR:
+                        hard.append(rec)
+                    elif not is_loc and claimed > actual * SCALE_OVERSTATE_FACTOR:
+                        soft.append(rec + ('文件数类,口径有约定性',))
+                else:  # 目录 → 数源文件
+                    actual = _count_source_files(target)
+                    if actual and claimed > actual * SCALE_OVERSTATE_FACTOR:
+                        soft.append((os.path.basename(doc), nearest, claimed, actual,
+                                     ln.strip()[:70], '目录类,仅参考'))
+    return hard, soft
+
+
+# ----------------------------------------------------------------------------
+# main:argparse + 退出码门禁。
+# ----------------------------------------------------------------------------
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description='repo-knowledge-map 覆盖审计(规范见 references/coverage-audit.md)')
+    here = os.path.dirname(os.path.abspath(__file__))
+    ap.add_argument('--repo', default=detect_repo_root(here), help='目标仓库根(默认自动探测)')
+    ap.add_argument('--km-dir', default=None, help='知识地图目录(默认 <repo>/.knowledge-map)')
+    ap.add_argument('--excluded', default=None, help='EXCLUDED yaml(默认 <km-dir>/audit-excluded.yaml)')
+    ap.add_argument('--graph', default=None, help='graph.json(默认 <km-dir>/zh/meta/graph.json)')
+    args = ap.parse_args(argv)
+
+    repo = os.path.abspath(args.repo)
+    km = args.km_dir or os.path.join(repo, '.knowledge-map')
+    excluded_yaml = args.excluded or os.path.join(km, 'audit-excluded.yaml')
+    graph_path = args.graph or os.path.join(km, 'zh', 'meta', 'graph.json')
+
+    if not os.path.exists(graph_path):
+        print(f'❌ 找不到 graph.json: {graph_path}', file=sys.stderr)
+        return 2
+
+    excluded = list(DEFAULT_EXCLUDED.items()) + parse_excluded(excluded_yaml)
+    graph = json.load(open(graph_path, encoding='utf-8'))
+
+    print('=' * 64)
+    print('A 关 — 覆盖完备(标尺 = os.listdir 文件系统,非 AI 产物)')
+    print('=' * 64)
+    cov = audit_coverage(repo, graph, excluded, km)
+    for x in cov['orphans']:
+        print(f'  🔴 孤儿(结构性遗漏): {x}')
+    for x in cov['weak']:
+        print(f'  🟡 弱覆盖(在 files/path 但无真 cite): {x}')
+    print(f"  顶层 {len(cov['top'])} / 已覆盖 {len(cov['covered'])} / "
+          f"显式排除 {len(cov['excluded'])} / 🔴孤儿 {len(cov['orphans'])} / 🟡弱覆盖 {len(cov['weak'])}")
+
+    print('\n' + '=' * 64)
+    print('B 关 — 计数一致(辅助:只抓不一致,抓不到共同遗漏)')
+    print('=' * 64)
+    by_kind, claims = audit_counts(graph, km)
+    print(f'  graph 节点计数(按 kind): {by_kind}')
+    if claims:
+        print(f'  文档计数断言(需与 graph 人工核对): {claims}')
+    else:
+        print('  (未配 DOC_COUNT_REGEXES → B 关降级:仅报 graph 计数,未作文档比对)')
+
+    print('\n' + '=' * 64)
+    print('C 关 — cite 验真')
+    print('=' * 64)
+    total, bad = audit_cites(repo, km)
+    for typ, ref in bad:
+        print(f'  🔴 {typ}: {ref}')
+    print(f'  {total} 个唯一 cite,失效 {len(bad)},有效率 {round(100 * (total - len(bad)) / max(1, total))}%')
+
+    print('\n' + '=' * 64)
+    print('规模真实(wc 实测 vs 文档断言)')
+    print('=' * 64)
+    hard, soft = verify_scale(repo, km)
+    for doc, f, claimed, actual, ctx in hard:
+        print(f'  🔴 规模不符(文件 LOC): {f} 文档 {claimed} 实测 {actual}  ← {ctx}')
+    for rec in soft:
+        print(f'  ⚪ 规模存疑(目录/计数类,仅参考): {rec[1]} 文档 {rec[2]} 实测 {rec[3]}')
+    if not hard and not soft:
+        print('  (未发现可自动核对的规模断言,或全部吻合)')
+
+    # 退出码门禁:A 无孤儿 且 C 全过 且 无文件级规模硬不符
+    ok = (len(cov['orphans']) == 0) and (len(bad) == 0) and (len(hard) == 0)
+    print('\n' + '=' * 64)
+    if ok:
+        print('结论: ✅ 严密(无孤儿 + cite 全过 + 文件级规模真实)')
+    else:
+        print(f"结论: ❌ 不严密(孤儿 {len(cov['orphans'])} + cite 失效 {len(bad)} + 规模硬不符 {len(hard)})")
+    print('=' * 64)
+    return 0 if ok else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

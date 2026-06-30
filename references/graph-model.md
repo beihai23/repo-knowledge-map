@@ -11,6 +11,7 @@
 | `name` | string | 展示名 |
 | `path` | string | 代码位置(目录或文件) |
 | `cite` | string | `file://相对路径#L起-L止`;`Function`/`Endpoint` 尽量必填 |
+| `files` | string[] | 该节点覆盖的顶层文件/目录路径(相对仓库根)。供覆盖审计抽覆盖集(见 `coverage-audit.md`)。`Subsystem`/`Service` 常关联多文件,单 `cite` 不足以表达覆盖范围——`cite` 是单点证据,`files` 是覆盖范围,二者互补。 |
 | `meta` | object | 扩展字段(如 Service 的 `protocol`、DataStore 的 `engine`) |
 
 ## 边 Edge
